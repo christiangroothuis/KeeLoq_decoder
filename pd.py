@@ -59,9 +59,19 @@ class Decoder(srd.Decoder):
         self.TEcnt = 0  # TE counter
         self.Block_Init = 0  # Flag for each block of info
         # TE Timing - According to documentation a TE is typically 400 usecs
-        # [0][1] - TE/Logical Bit 1 | [2][3] - Logical Bit 0 | [4][5] - Header Lenght
+        # [0][1] - TE/Logical Bit 1 | [2][3] - Logical Bit 0 | [4][5] - Header Length
         self.TE_Timing = [280e-6, 580e-6, 700e-6, 1000e-6, 3e-3, 6e-3]
-        self.ssBlock = 0  # Sample number of a block of intormation
+        # Preamble thresholds:
+        #   Standard preamble: 23 TEs @ ~400µs
+        #   Short preamble:   45 TEs @ ~200µs
+        self.PREAMBLE_TE_Count_Std = 23
+        self.PREAMBLE_TE_Count_Short = 45
+        # Short‐TE timing window (half of standard TE range: 140–290 µs)
+        self.PREAMBLE_TE_Timing_Short = [
+            self.TE_Timing[0] * 0.5,  # 140e-6
+            self.TE_Timing[1] * 0.5,  # 290e-6
+        ]
+        self.ssBlock = 0  # Sample number of a block of information
         self.Header_Completed = 0  # [ 0 = Not Complete 1 = Complete]
         self.n = 0  # Current Sample number
         self.prevN = 0  # Previous sample number
@@ -92,11 +102,25 @@ class Decoder(srd.Decoder):
             self.Block_Init = 1
             self.ssBlock = self.prevN
 
-    # Shows Preable + Header
+    # Shows Preamble + Header (supports both short and standard TE preambles)
     def Decode_Preable(self, t):
-        # According to documentation a TE is typically 400 usecs
-        if t >= self.TE_Timing[0] and t <= self.TE_Timing[1]:
-            if self.TEcnt < 23:
+        # Check for short‐TE range (≈ 200 µs) or standard TE range (≈ 400 µs)
+        in_short_te = (t >= self.PREAMBLE_TE_Timing_Short[0] and t <= self.PREAMBLE_TE_Timing_Short[1])
+        in_std_te = (t >= self.TE_Timing[0] and t <= self.TE_Timing[1])
+
+        # Preamble detection
+        if in_short_te or in_std_te:
+            # Short preamble counting
+            if in_short_te and (self.TEcnt < self.PREAMBLE_TE_Count_Short):
+                self.put(
+                    self.prevN,
+                    self.samplenum,
+                    self.out_ann,
+                    [Ann.TE, [str(self.TEcnt)]],
+                )
+                self.Start_Block()
+            # Standard preamble counting
+            elif in_std_te and (self.TEcnt < self.PREAMBLE_TE_Count_Std):
                 self.put(
                     self.prevN,
                     self.samplenum,
@@ -105,23 +129,33 @@ class Decoder(srd.Decoder):
                 )
                 self.Start_Block()
 
-            # Shows Preamble
-            elif self.TEcnt == 23:
+            # When TEcnt reaches one of the thresholds, mark Preamble
+            if (in_short_te and self.TEcnt == self.PREAMBLE_TE_Count_Short) or (
+                in_std_te and self.TEcnt == self.PREAMBLE_TE_Count_Std
+            ):
                 self.put(
-                    self.ssBlock, self.n, self.out_ann, [Ann.CODE_WORD, ["Preamble"]]
+                    self.ssBlock,
+                    self.n,
+                    self.out_ann,
+                    [Ann.CODE_WORD, ["Preamble"]],
                 )
                 self.put(
-                    self.prevN, self.samplenum, self.out_ann, [0, [str(self.TEcnt)]]
+                    self.prevN,
+                    self.samplenum,
+                    self.out_ann,
+                    [0, [str(self.TEcnt)]],
                 )
 
-        # We have reached the last Rising Edge on TEcnt == 24
-        # This is not technically a TE . It is actually a period of 10 TEs known as Header
-        # Header has usually a lenth of 3-6 msec
-        elif (t >= self.TE_Timing[4] and t <= self.TE_Timing[5]) and (self.TEcnt == 24):
+        # Header detection: next TE after preamble should be ~10× TE (3–6 ms)
+        elif (
+            (t >= self.TE_Timing[4] and t <= self.TE_Timing[5])
+            and (self.TEcnt == self.PREAMBLE_TE_Count_Std + 1
+                 or self.TEcnt == self.PREAMBLE_TE_Count_Short + 1)
+        ):
             self.put(self.prevN, self.n, self.out_ann, [Ann.CODE_WORD, ["Header"]])
             self.TEcnt = 0
             self.Block_Init = 0
-            self.Header_Completed = 1  # Is 1 when the decoder successfully reached the end of Preable + Header
+            self.Header_Completed = 1  # Is 1 when decoder has finished Preamble + Header
 
         else:  # Reset Counters because this is not a TE
             self.TEcnt = 0
@@ -129,35 +163,30 @@ class Decoder(srd.Decoder):
 
     # In Data Portion bits are encoded using PWM technique
     def Decode_LogicalBit(self, t):
-        # Logic Bit 0 = 2 TE at High Level + 1 TE at low level >> Tipically 800 usec (H) + 400 usec (L) <<
-        # Logic Bit 1 = 1 TE at High Level + 2 TE at Low Level >> Tipically 400 usec (H) + 800 usec (L) <<
-        #   Thus, To recognise a logical bit we have to read two subsequent Edges (or HalfBits)
+        # Logic Bit 0 = 2 TE at High Level + 1 TE at low level >> typically 800 usec (H) + 400 usec (L) <<
+        # Logic Bit 1 = 1 TE at High Level + 2 TE at Low Level >> typically 400 usec (H) + 800 usec (L) <<
+        # Thus, to recognise a logical bit we have to read two subsequent edges (or half‐bits)
 
         LogicalBit = ""  # Either '0' or '1' encoded using PWM
         Valid_Bit = 0
 
-        # Check timing validity first
+        # Check timing validity first (half‐bit: ~400 µs or ~800 µs)
         if (t >= self.TE_Timing[0] and t <= self.TE_Timing[1]) or (
             t >= self.TE_Timing[2] and t <= self.TE_Timing[3]
         ):
             Valid_Bit = 1
 
-            # Having got the next edge pointer n = first half of the Logical bit
             if Valid_Bit:
                 self.Start_Block()
 
-                # Gets the the next second half of the Logical bit to fully decode it
-                if (
-                    self.Bitcnt == 65
-                ):  # Last bit needs special care as definitely there is no valid edge nearby
-                    self.n = (
-                        self.samplenum + 8
-                    )  # Arbitrary value after last sample# to complete this Logical Bit
+                # Gets the the next second half of the logical bit to fully decode it
+                if self.Bitcnt == 65:  # Last bit needs special care as definitely there is no next edge
+                    self.n = self.samplenum + 8  # Arbitrary sample# after last to complete this bit
                 else:
                     self.wait(self.trig_cond)
                     self.n = self.samplenum
 
-                # After time validity, it check wether it is '1' or '0'
+                # After time validity, check whether it is '1' or '0'
                 if t >= self.TE_Timing[0] and t <= self.TE_Timing[1]:
                     LogicalBit = "1"
                 else:
@@ -171,7 +200,7 @@ class Decoder(srd.Decoder):
                 )
                 return LogicalBit
 
-        else:  # In case of Invalid bit, Reset all counters and conditions
+        else:  # Invalid bit timing → reset counters
             self.put(
                 self.prevN,
                 self.n,
@@ -180,7 +209,7 @@ class Decoder(srd.Decoder):
             )
             self.Reset_DP_Cnts()
             self.Header_Completed = 0
-            self.Bitcnt = -1  # Will be set to 0 in the Main Cycle
+            self.Bitcnt = -1  # Will be set to 0 in main decode loop
             return "0"
 
     # Reset Data Portion counters at the end of each decoded block
@@ -188,23 +217,18 @@ class Decoder(srd.Decoder):
         self.Block_Init = 0
         self.BitString = ""
 
-    # Convert a Binary string into the equivalent value in Hex 0x in string format
+    # Convert a Binary string into the equivalent value in Hex (0x...) as a string
     def Bin2Hex(self):
         decimal_value = int(self.BitString, 2)
-        # Convert integer to hexadecimal with leading zeroes
+        # Convert integer to hexadecimal with leading zeroes (7 hex digits)
         hex_value = "0x{0:0{1}X}".format(decimal_value, 7)
         return hex_value
 
-    # Decode all Logical PWM Bit from 0 to 65 completing the CodeWord
+    # Decode all logical PWM bits from 0 to 65, completing the CodeWord
     def Decode_DataPortion(self, t):
-        # Bits 0-31 : Encrypted Portion. It comes from the algorithm.
+        # Bits 0-31: Encrypted portion (comes from the KeeLoq algorithm)
         if self.Bitcnt <= 31:
-            # According to the documentation LSB is transmitted first.
-            #   However, decoding a bit string to Hex, requires that LSB must be the last bit in the string sequence
-            #   to preserve bit significance.
-            #   That's why --self.BitString-- is appended always as LSB, whereas the last transmitted bit
-            #   is considered as MSB. This ensures the right interpretation and conversion to Hex
-            #   for both Encrypted and Fixed portion
+            # LSB is transmitted first; prepend to BitString so MSB ends last
             self.BitString = self.Decode_LogicalBit(t) + self.BitString
 
             if self.Bitcnt == 31:
@@ -223,9 +247,8 @@ class Decoder(srd.Decoder):
                 )
                 self.Reset_DP_Cnts()
 
-        # Here begins the cleartext portion known as Fixed Portion
-        #   it is made by Serial Number + Button Code + Status (V-Low + Repeat\)
-        elif self.Bitcnt >= 32 and self.Bitcnt <= 59:  # Bits 32-59 : Serial Number
+        # Bits 32-59: Serial Number (Fixed portion)
+        elif self.Bitcnt >= 32 and self.Bitcnt <= 59:
             self.BitString = self.Decode_LogicalBit(t) + self.BitString
 
             if self.Bitcnt == 59:
@@ -244,7 +267,8 @@ class Decoder(srd.Decoder):
                 )
                 self.Reset_DP_Cnts()
 
-        elif self.Bitcnt >= 60 and self.Bitcnt <= 63:  # Bits 60-63 : Button Code
+        # Bits 60-63: Button Code (S3, S0, S1, S2)
+        elif self.Bitcnt >= 60 and self.Bitcnt <= 63:
             LogicalBit = self.Decode_LogicalBit(t)
 
             if self.Bitcnt == 60:
@@ -284,8 +308,8 @@ class Decoder(srd.Decoder):
                 )
                 self.Reset_DP_Cnts()
 
-        # Status
-        elif self.Bitcnt == 64:  # Bits 64 : V-Low
+        # Bit 64: V-Low status
+        elif self.Bitcnt == 64:
             LogicalBit = self.Decode_LogicalBit(t)
 
             self.put(self.ssBlock, self.n, self.out_ann, [Ann.CODE_WORD, ["V-Low"]])
@@ -302,7 +326,8 @@ class Decoder(srd.Decoder):
             )
             self.Reset_DP_Cnts()
 
-        elif self.Bitcnt == 65:  # Bits 65 : Repeat
+        # Bit 65: Repeat (RPT)
+        elif self.Bitcnt == 65:
             LogicalBit = self.Decode_LogicalBit(t)
 
             self.put(self.ssBlock, self.n, self.out_ann, [Ann.CODE_WORD, ["RPT"]])
@@ -316,9 +341,7 @@ class Decoder(srd.Decoder):
             )
             self.Reset_DP_Cnts()
             self.Header_Completed = 0  # Looks for another new CodeWord
-            self.Bitcnt = (
-                -1
-            )  # To start from 0 in the Main - decode() it needs to be negative
+            self.Bitcnt = -1  # To start from 0 in main decode()
 
     # Main Loop
     def decode(self):
